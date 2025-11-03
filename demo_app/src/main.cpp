@@ -1,4 +1,4 @@
-// ===== Unified ESP32 IoT Demo: DHT11 + LDR + Flame (LM393) + MQ-2 =====
+// ===== Unified ESP32 IoT Demo: DHT20 (I2C) + LDR + Flame (LM393) + MQ-2 =====
 // WiFi config page (AP fallback) + Preferences + HTTP Dashboard + REST + MQTT
 
 #include <Arduino.h>
@@ -6,16 +6,21 @@
 #include <WebServer.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include <DHT.h>
 #include <Preferences.h>
 
-// ---------------- Pins ----------------
-#define DHTPIN    14
-#define DHTTYPE   DHT11
-#define LED_PIN   2
-#define FLAME_DO_PIN 10        // LM393 (DO) - LOW = phát hiện lửa
-#define MQ2_AO_PIN   1        // MQ-2 (AO) 0..4095
-#define LDR_PIN      35        // LDR chuyển sang ADC35 để tránh trùng với MQ-2
+// --- DHT20 (AHT20) ---
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+
+// ---------------- Pins (Yolo UNO / ESP32-S3) ----------------
+// DHT20 dùng I2C, không cần chân data riêng
+#define I2C_SDA_PIN   11      // SDA theo pinout Yolo UNO
+#define I2C_SCL_PIN   12      // SCL theo pinout Yolo UNO
+
+#define LED_PIN       2
+#define FLAME_DO_PIN 10       // D7 -> GPIO10 (LM393 DO) - LOW = phát hiện lửa
+#define MQ2_AO_PIN    1       // A0 -> GPIO1 (ADC1_CH0)
+#define LDR_PIN       2       // A1 -> GPIO2 (ADC1_CH1)
 
 // ---------- MQ-2 params / ADC ----------
 const int   N_SAMPLES       = 20;      // số mẫu trung bình ADC MQ-2
@@ -26,7 +31,8 @@ const char* MQTT_BROKER = "test.mosquitto.org";
 const uint16_t MQTT_PORT = 1883;
 
 // ---------- Globals ----------
-DHT dht(DHTPIN, DHTTYPE);
+Adafruit_AHTX0 aht;                    // đối tượng cho DHT20/AHT20
+
 WebServer server(80);
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
@@ -87,14 +93,21 @@ void setup() {
   analogSetPinAttenuation(MQ2_AO_PIN, ADC_11db);
   analogSetPinAttenuation(LDR_PIN,    ADC_11db);
 
-  dht.begin();
+  // --- I2C + DHT20 (AHT20) ---
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  bool ok = aht.begin(&Wire);   // địa chỉ mặc định 0x38
+  if (!ok) {
+    Serial.println("AHT20 init FAILED (check SDA/SCL wiring, power).");
+  } else {
+    Serial.println("AHT20 init OK.");
+  }
+  delay(1000); // cho sensor ổn định
 
   // Preferences
   preferences.begin("iot-config", false);
-  // giữ default theo yêu cầu gốc (có thể sửa tùy bạn)
   wifi_ssid = preferences.getString("wifi_ssid", "ACLAB");
   wifi_pass = preferences.getString("wifi_pass", "ACLAB2023");
-  send_interval = preferences.getLong("interval", 30000);
+  send_interval = preferences.getLong("interval", send_interval); // ms
 
   DEVICE_ID = build_device_id();
 
@@ -130,7 +143,7 @@ void setup() {
     if (currentMQ2ADC >= 0)         rdoc["mq2_adc"]     = currentMQ2ADC;
     rdoc["gas"]     = currentGas;
     rdoc["uptime_ms"] = millis();
-    rdoc["ts_epoch"]  = (uint64_t) (millis()); // epoch giả định theo uptime
+    rdoc["ts_epoch"]  = (uint64_t)(millis()); // dùng uptime giả epoch
     String out; serializeJson(rdoc, out);
     server.sendHeader("Access-Control-Allow-Origin", "*");
     server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -236,9 +249,10 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   if (doc["interval"].is<long>()) {
     long new_interval = doc["interval"].as<long>();
     if (new_interval > 0) {
+      // new_interval giả định là ms
       send_interval = new_interval;
       preferences.putLong("interval", send_interval);
-      Serial.print("Updated interval: "); Serial.println(send_interval);
+      Serial.print("Updated interval (ms): "); Serial.println(send_interval);
     }
   }
 
@@ -269,25 +283,24 @@ void reconnect_mqtt() {
 }
 
 void read_all_sensors_and_publish(bool publishMqtt) {
-  // DHT
-  float h = dht.readHumidity();
-  float t = dht.readTemperature();
-
-  if (isnan(h) || isnan(t)) {
-    Serial.println("Failed to read DHT");
+  // --- DHT20 (AHT20) ---
+  sensors_event_t humidity, temp;
+  bool ok = aht.getEvent(&humidity, &temp); // đọc cả hai
+  if (ok) {
+    currentTemperature = temp.temperature;                  // °C
+    currentHumidity    = humidity.relative_humidity;        // %
   } else {
-    currentHumidity    = h;
-    currentTemperature = t;
+    Serial.println("Failed to read AHT20 (check wiring)");
   }
 
-  // LDR
+  // LDR (A1/GPIO2)
   currentLight = analogRead(LDR_PIN);
 
   // Flame (LM393 DO): LOW = phát hiện lửa
   int rawFlame = digitalRead(FLAME_DO_PIN);
   currentFlame = (rawFlame == LOW);
 
-  // MQ-2 ADC (trung bình)
+  // MQ-2 ADC (trung bình, A0/GPIO1)
   currentMQ2ADC = readAvgADC(MQ2_AO_PIN);
   currentGas    = (currentMQ2ADC > MQ2_THRESHOLD);
 
@@ -314,7 +327,7 @@ void read_all_sensors_and_publish(bool publishMqtt) {
 }
 
 void handle_root() {
-  // Trang đã bổ sung thẻ hiển thị Flame/MQ-2 và trạng thái Gas
+  // (Giữ nguyên HTML; chỉ nhãn vẫn đúng vì không ghi tên cảm biến)
   String html = R"rawliteral(
 <!DOCTYPE html>
 <html lang="vi">
@@ -361,7 +374,7 @@ void handle_root() {
       </div>
       <div class="col-md-4 mb-4">
         <div class="card text-center">
-          <div class="card-header"><h5 class="card-title">Ánh sáng (ADC35)</h5></div>
+          <div class="card-header"><h5 class="card-title">Ánh sáng (A1/GPIO2)</h5></div>
           <div class="card-body"><p class="card-text" id="light-value">----</p></div>
         </div>
       </div>
@@ -376,7 +389,7 @@ void handle_root() {
       </div>
       <div class="col-md-4 mb-4">
         <div class="card text-center">
-          <div class="card-header"><h5 class="card-title">MQ-2 ADC (ADC34)</h5></div>
+          <div class="card-header"><h5 class="card-title">MQ-2 ADC (A0/GPIO1)</h5></div>
           <div class="card-body"><p class="card-text mono" id="mq2-adc">----</p></div>
         </div>
       </div>
@@ -521,7 +534,6 @@ void handle_root() {
     window.addEventListener('load', ()=>{
       pollLocalData();
       setInterval(pollLocalData, 2000);
-      // Hiển thị DEVICE_ID nếu muốn lấy từ /status
       fetch('/status').then(r=>r.json()).then(s=>{
         const el = document.getElementById('device-id');
         if (s && s.device_id) el.value = s.device_id;
@@ -542,7 +554,7 @@ void handle_save() {
   if (interval.length() > 0) {
     long iv = interval.toInt();
     if (iv > 0) {
-      send_interval = (unsigned long)iv * 1000UL;
+      send_interval = (unsigned long)iv * 1000UL; // giây -> ms
       preferences.putLong("interval", send_interval);
     }
   }
