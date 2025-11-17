@@ -11,7 +11,7 @@
 // CẤU HÌNH FIREBASE 
 // ================================================================
 // Lấy từ Project Settings -> General -> Web API Key
-#define API_KEY "YOUR_WEB_API_KEY" 
+#define API_KEY "AIzaSyDw9gghwYr_agyJzMKdKSi42P5aIHcUyIA" 
 
 // Lấy từ Realtime Database -> Data (link ở trên cùng)
 #define DATABASE_URL "https://smart-fire-alarm-project-default-rtdb.asia-southeast1.firebasedatabase.app/" 
