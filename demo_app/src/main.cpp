@@ -1,61 +1,72 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WebServer.h>           
-#include <ArduinoJson.h>         
-#include <DHT.h>
+#include <WiFiManager.h>          // Quản lý WiFi
+#include <WebServer.h>            // Cho /data, /status
+#include <ArduinoJson.h>          // Cho /data, /status
+#include <Firebase_ESP_Client.h>  // Cho Firebase
 #include <Preferences.h>
-#include <WiFiManager.h>          
-#include <Firebase_ESP_Client.h>  
+
+// Thư viện cảm biến mới của Sơn
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
 
 // ================================================================
-// CẤU HÌNH FIREBASE 
+// MODULE: CẤU HÌNH (FIREBASE & PINS)
 // ================================================================
-// Lấy từ Project Settings -> General -> Web API Key
+
+// --- 1. CẤU HÌNH FIREBASE (Giữ nguyên của bạn) ---
 #define API_KEY "AIzaSyDw9gghwYr_agyJzMKdKSi42P5aIHcUyIA" 
-
-// Lấy từ Realtime Database -> Data (link ở trên cùng)
 #define DATABASE_URL "https://smart-fire-alarm-project-default-rtdb.asia-southeast1.firebasedatabase.app/" 
-
-// Lấy từ Project Settings -> General -> Project ID
 #define PROJECT_ID "smart-fire-alarm-project"
-
 #define USER_EMAIL "test.user@gmail.com"
 #define USER_PASSWORD "test123456"
 
+// --- 2. CẤU HÌNH PHẦN CỨNG (Lấy từ code mới của Sơn) ---
+// DHT20 dùng I2C
+#define I2C_SDA_PIN   11  // SDA
+#define I2C_SCL_PIN   12  // SCL
+// Cảm biến
+#define LED_PIN       2
+#define FLAME_DO_PIN  10  // Digital Out của cảm biến Lửa (LOW = có lửa)
+#define MQ2_AO_PIN    1   // Analog Out của MQ2
+#define LDR_PIN       2   // Analog In của LDR
+
+// Ngưỡng báo động (Lấy từ code mới của Sơn)
+#define MQ2_THRESHOLD     2000  // Ngưỡng ADC để báo Gas
+#define N_SAMPLES         20    // Số mẫu lấy trung bình cho MQ2
 
 // ================================================================
-// CẤU HÌNH PHẦN CỨNG 
+// MODULE: BIẾN TOÀN CỤC VÀ ĐỐI TƯỢNG
 // ================================================================
-#define DHTPIN   14
-#define DHTTYPE  DHT11
-#define LED_PIN  2
-#define LDR_PIN  34 // Cảm biến ánh sáng
 
+// --- 1. Đối tượng Cảm biến & Server ---
+Adafruit_AHTX0 aht;       // Đối tượng AHT20 (thay cho DHT)
+WebServer server(80);
+Preferences preferences;
 
-// ================================================================
-// KHỞI TẠO CÁC ĐỐI TƯỢNG TOÀN CỤC ===
-// ================================================================
-DHT dht(DHTPIN, DHTTYPE);
-WebServer server(80);            
-Preferences preferences;         
-
-// Biến toàn cục của Firebase
+// --- 2. Đối tượng Firebase ---
 FirebaseData fbdo;
 FirebaseData stream_fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
-// Biến toàn cục
-unsigned long send_interval = 30000; // Mặc định 30 giây (sẽ được cập nhật từ Firebase)
-unsigned long last_sent_time = 0;
+// --- 3. Biến Trạng thái & Cấu hình ---
 String DEVICE_ID;
+unsigned long send_interval = 30000; // Mặc định 30 giây
+unsigned long last_sent_time = 0;
 
-//Biến lưu cảm biến để cho /data endpoint
+// --- 4. Biến Lưu trữ Cảm biến (cho /data và Firebase) ---
 float currentTemperature = NAN;
-float currentHumidity = NAN;
-int currentLight = -1;
+float currentHumidity  = NAN;
+int   currentLight     = -1;
+bool  currentFlame     = false; // (mới)
+int   currentMQ2ADC    = -1;    // (mới)
+bool  currentGas       = false; // (mới)
 
-// Helper tạo Device ID
+// ================================================================
+// MODULE: CÁC HÀM TIỆN ÍCH (Helpers)
+// ================================================================
+
 String build_device_id() {
   uint8_t mac[6];
   WiFi.macAddress(mac);
@@ -64,42 +75,67 @@ String build_device_id() {
   return String(buf);
 }
 
-// Hàm này sẽ gửi data lên FIREBASE
-void read_and_publish_data() {
-  float h = dht.readHumidity();
-  float t = dht.readTemperature();
-  int l = analogRead(LDR_PIN);
+static int readAvgADC(int pin, int n = N_SAMPLES) {
+  long s = 0;
+  for (int i = 0; i < n; ++i) {
+    s += analogRead(pin);
+    delay(5);
+  }
+  return (int)(s / n);
+}
 
-  if (isnan(h) || isnan(t)) {
-    Serial.println("Failed to read DHT");
-    return;
+// ================================================================
+// MODULE: CẢM BIẾN (Đọc & Gửi dữ liệu)
+// ================================================================
+
+void read_sensors_and_publish() {
+  // --- 1. Đọc Cảm biến  ---
+  
+  // Đọc AHT20 (Nhiệt độ, Độ ẩm)
+  sensors_event_t humidity, temp;
+  bool ok = aht.getEvent(&humidity, &temp);
+  if (ok) {
+    currentTemperature = temp.temperature;
+    currentHumidity  = humidity.relative_humidity;
+  } else {
+    Serial.println("Failed to read AHT20");
   }
 
-  // Cập nhật biến toàn cục để /data web server dùng
-  currentTemperature = t;
-  currentHumidity = h;
-  currentLight = l;
+  // Đọc LDR
+  currentLight = analogRead(LDR_PIN);
 
-  Serial.printf("[%lu] Sending data: T=%.1f C, H=%.1f %%, Light=%d\n",
-                  millis() / 1000, t, h, l);
+  // Đọc Cảm biến Lửa (Digital)
+  currentFlame = (digitalRead(FLAME_DO_PIN) == LOW); // LOW = phát hiện lửa
 
-  // ----------------------------------------------------------------
-  // Gửi dữ liệu lên Firestore
-  // ----------------------------------------------------------------
+  // Đọc Cảm biến Khí Gas (Analog)
+  currentMQ2ADC = readAvgADC(MQ2_AO_PIN);
+  currentGas  = (currentMQ2ADC > MQ2_THRESHOLD);
+
+  // Log ra Serial
+  Serial.printf("[SENSOR] T=%.1fC H=%.1f%% | LDR=%d | Flame=%s | MQ2=%d Gas=%s\n",
+                currentTemperature, currentHumidity, currentLight,
+                currentFlame ? "YES" : "NO",
+                currentMQ2ADC, currentGas ? "YES" : "NO");
+
+  // --- 2. Gửi dữ liệu lên Firestore ---
   if (!Firebase.ready()) {
     Serial.println("Firebase not ready, skipping publish");
     return;
   }
 
   FirebaseJson content;
-  content.set("fields/temperature/doubleValue", String(t));
-  content.set("fields/humidity/doubleValue", String(h));
-  content.set("fields/light/integerValue", String(l)); // Thêm cảm biến ánh sáng
+  // Thêm tất cả các trường mới
+  content.set("fields/temperature/doubleValue", String(currentTemperature));
+  content.set("fields/humidity/doubleValue", String(currentHumidity));
+  content.set("fields/light/integerValue", String(currentLight));
+  content.set("fields/flame/booleanValue", currentFlame); // Dùng kiểu boolean
+  content.set("fields/mq2_adc/integerValue", String(currentMQ2ADC));
+  content.set("fields/gas/booleanValue", currentGas); // Dùng kiểu boolean
   content.set("fields/deviceId/stringValue", DEVICE_ID);
   content.set("fields/timestamp/timestampValue", Firebase.getServerTime(fbdo));
 
-  String documentPath = "sensor_logs"; // Gửi vào collection này
-  
+  // Gửi lên collection 'sensor_logs'
+  String documentPath = "sensor_logs";
   Serial.println("Sending data to Firestore...");
   if (Firebase.Firestore.createDocument(&fbdo, PROJECT_ID, "", documentPath.c_str(), content.raw())) {
     Serial.println(">>> SUCCESS: Sent data to Firestore");
@@ -108,30 +144,22 @@ void read_and_publish_data() {
   }
 }
 
-
 // ================================================================
-// CÁC HÀM CỦA FIREBASE 
+// MODULE: FIREBASE (Callback)
 // ================================================================
 
-// Hàm này được gọi khi có thay đổi trên Realtime Database
-// (Khi App Flutter thay đổi cấu hình)
 void streamCallback(StreamData data) {
-  Serial.println("====================================");
   Serial.println("STREAM DATA RECEIVED (Config changed)");
-  Serial.println("====================================");
-
   if (data.dataType() == "json") {
     FirebaseJson *json = data.to<FirebaseJson *>();
     FirebaseJsonData result;
 
-    // Yêu cầu: App cho phép điều chỉnh chu kỳ gửi dữ liệu
     if (json->get(result, "sendInterval")) {
       if (result.type == "int") {
         send_interval = result.to<int>();
         Serial.println(">>> Updated sendInterval to: " + String(send_interval) + " ms");
       }
     }
-    // thêm code xử lý "deviceId" hoặc "wifi" ở đây
   }
 }
 
@@ -144,30 +172,43 @@ void tokenStatusCallback(TokenInfo info) {
   else Serial.println("!!! Firebase Token status: " + info.error.message);
 }
 
-
 // ================================================================
-// HÀM CÀI ĐẶT (SETUP)
+// HÀM CHÍNH: SETUP
 // ================================================================
 void setup() {
   Serial.begin(115200);
-  pinMode(LED_PIN, OUTPUT);
-  pinMode(LDR_PIN, INPUT);
   delay(200);
 
-  dht.begin();
+  // --- 1. Khởi tạo Cảm biến  ---
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(FLAME_DO_PIN, INPUT_PULLUP); // Dùng INPUT_PULLUP
+  pinMode(MQ2_AO_PIN, INPUT);
+  pinMode(LDR_PIN, INPUT);
+
+  // Cấu hình ADC
+  analogReadResolution(12);
+  analogSetPinAttenuation(MQ2_AO_PIN, ADC_11db);
+  analogSetPinAttenuation(LDR_PIN, ADC_11db);
+
+  // Khởi tạo I2C và AHT20
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  if (!aht.begin(&Wire)) {
+    Serial.println("AHT20 init FAILED");
+  } else {
+    Serial.println("AHT20 init OK.");
+  }
+
+  // --- 2. Lấy Device ID ---
   DEVICE_ID = build_device_id();
   Serial.println("Device ID: " + DEVICE_ID);
 
-  // ----------------------------------------------------------------
-  // THAY THẾ code WiFi gốc bằng WiFiManager
-  // ----------------------------------------------------------------
+  // --- 3. Khởi tạo WiFi ---
   WiFiManager wm;
   // wm.resetSettings(); // Bỏ comment nếu muốn xóa WiFi đã lưu
   Serial.println("Connecting to WiFi (or starting AP mode)...");
-  bool res = wm.autoConnect("ESP32-FireAlarm-Setup"); // Tên WiFi AP để cấu hình
-
+  bool res = wm.autoConnect("ESP32-FireAlarm-Setup");
   if (!res) {
-    Serial.println("!!! Failed to connect to WiFi. Restarting...");
+    Serial.println("!!! Failed to connect WiFi. Restarting...");
     ESP.restart();
   } else {
     Serial.println(">>> WiFi Connected!");
@@ -175,17 +216,11 @@ void setup() {
     Serial.println(WiFi.localIP());
   }
 
-  // ----------------------------------------------------------------
-  // Start server routes
-  // ----------------------------------------------------------------
+  // --- 4. Khởi tạo WebServer (Cho /data và /status) ---
+  // (Endpoint /status giữ nguyên)
   server.on("/status", HTTP_GET, [](){
     DynamicJsonDocument sdoc(256);
-    uint8_t mac[6];
-    WiFi.macAddress(mac);
-    char macbuf[18];
-    sprintf(macbuf, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     sdoc["device_id"] = DEVICE_ID;
-    sdoc["mac"] = String(macbuf);
     sdoc["ip"] = WiFi.localIP().toString();
     sdoc["uptime_ms"] = millis();
     String out;
@@ -193,11 +228,15 @@ void setup() {
     server.send(200, "application/json", out);
   });
   
+  // (CẬP NHẬT /data để trả về TẤT CẢ cảm biến)
   server.on("/data", HTTP_GET, [](){
-    DynamicJsonDocument rdoc(128);
+    DynamicJsonDocument rdoc(256); // Tăng size
     if (!isnan(currentTemperature)) rdoc["temperature"] = currentTemperature;
     if (!isnan(currentHumidity)) rdoc["humidity"] = currentHumidity;
     if (currentLight >= 0) rdoc["light"] = currentLight;
+    rdoc["flame"] = currentFlame;     // (mới)
+    rdoc["mq2_adc"] = currentMQ2ADC;  // (mới)
+    rdoc["gas"] = currentGas;         // (mới)
     rdoc["uptime_ms"] = millis();
     String out;
     serializeJson(rdoc, out);
@@ -207,37 +246,35 @@ void setup() {
   server.begin();
   Serial.println("Web server started for /data and /status endpoints.");
 
-
-  // ----------------------------------------------------------------
-  // Khởi tạo Firebase
-  // ----------------------------------------------------------------
+  // --- 5. Khởi tạo Firebase ---
   Serial.println("Initializing Firebase...");
   config.api_key = API_KEY;
   config.database_url = DATABASE_URL;
   auth.user.email = USER_EMAIL;
   auth.user.password = USER_PASSWORD;
   config.token_status_callback = tokenStatusCallback;
-
   Firebase.begin(&config, &auth);
   Firebase.reconnectWiFi(true);
 
-  // ----------------------------------------------------------------
-  // Cấu hình từ App (RTDB)
-  // ----------------------------------------------------------------
+  // Đăng ký nghe thay đổi cấu hình từ Firebase RTDB
   String configPath = "devices/" + DEVICE_ID + "/config";
   if (!Firebase.RTDB.beginStream(&stream_fbdo, configPath.c_str())) {
     Serial.println("!!! FAILED to begin RTDB stream: " + stream_fbdo.errorReason());
   }
   Firebase.RTDB.setStreamCallback(&stream_fbdo, streamCallback, streamTimeoutCallback);
-  Serial.println(">>> Firebase Stream setup. Listening for config at:");
-  Serial.println(configPath);
+  Serial.println(">>> Firebase Stream setup. Listening for config at: " + configPath);
 }
 
+// ================================================================
+// HÀM CHÍNH: LOOP
+// ================================================================
 void loop() {
+  // Luôn chạy WebServer
   server.handleClient(); 
 
+  // Chỉ gửi dữ liệu khi Firebase sẵn sàng và đủ thời gian
   if (Firebase.ready() && (millis() - last_sent_time > send_interval)) {
     last_sent_time = millis();
-    read_and_publish_data(); 
+    read_sensors_and_publish(); // Gọi hàm đọc và gửi dữ liệu
   }
 }
